@@ -6,7 +6,8 @@ Exploring [Lonboard](https://developmentseed.org/lonboard/)'s new client-side CO
 - [lonboard](https://developmentseed.org/lonboard/) — GPU map rendering in Jupyter
 - [async-geotiff](https://developmentseed.org/async-geotiff/) — async COG reader
 - [obstore](https://developmentseed.org/obstore/) — Rust-backed object store client (S3, Azure, GCS)
-- [planetary-computer](https://github.com/microsoft/planetary-computer-sdk-for-python) + [pystac-client](https://pystac-client.readthedocs.io/) — STAC search + SAS signing
+- [pystac-client](https://pystac-client.readthedocs.io/) — STAC search
+- SAS signing handled by obstore's built-in [`PlanetaryComputerCredentialProvider`](https://developmentseed.org/obstore/latest/api/auth/planetary-computer/) — no Azure creds, auto-refresh
 - Notebooks run via `uvx juv run <notebook>.ipynb` (inline PEP 723 deps)
 
 ## Notebooks
@@ -15,5 +16,5 @@ Exploring [Lonboard](https://developmentseed.org/lonboard/)'s new client-side CO
 
 ## Working agreements
 - No tile server / proxy — everything is client-side (notebook process fetches COG byte ranges directly from Azure with a SAS token, renders RGBA in-process, hands PNG to deck.gl).
-- SAS tokens expire (~1h); re-run the STAC search cell to re-sign if tiles stop loading.
+- Optional `PC_SDK_SUBSCRIPTION_KEY` env var avoids anonymous rate limits (free signup).
 - Memory lives in `.claude/memory/` (gitignored), per global rules.
