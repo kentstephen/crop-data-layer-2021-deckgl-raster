@@ -5,6 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "async-geotiff>=0.4",
     "ipykernel>=7.2.0",
+    "lazycogs>=0.3.1",
+    "lonboard>=0.15.0",
     "morecantile>=7.0.3",
+    "numpy>=2",
+    "obstore>=0.9.2",
+    "pillow>=12.1.1",
+    "pyproj>=3.7.2",
+    "requests>=2.34.2",
+    "rustac>=0.9.11",
+    "sidecar>=0.8.1",
 ]
