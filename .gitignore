@@ -12,3 +12,6 @@ wheels/
 # Claude
 .claude/memory/
 .ipynb_checkpoints/
+
+# Generated parquet caches
+*.parquet

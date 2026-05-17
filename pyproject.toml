@@ -18,3 +18,8 @@ dependencies = [
     "rustac>=0.9.11",
     "sidecar>=0.8.1",
 ]
+
+[dependency-groups]
+dev = [
+    "nbconvert>=7.17.1",
+]
