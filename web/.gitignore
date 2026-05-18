@@ -1,0 +1,7 @@
+node_modules
+dist
+.vite
+*.tsbuildinfo
+# Generated; SAS tokens expire ~1hr after generation. Regenerate via
+# `uv run web/scripts/gen_stac.py` before opening the app.
+src/minimal_stac.json
