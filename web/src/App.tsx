@@ -77,23 +77,18 @@ async function getTileData(
   const { array } = tile;
   const { width, height } = array;
 
-  // CDL is single-band paletted uint8. We expect band-separate layout with
-  // exactly one band. If a pixel-interleaved tile ever appears here, the
-  // decoder layout differs from what we coded against — fail loudly.
-  if (array.layout !== "band-separate") {
-    throw new Error(
-      `CDL tile expected band-separate layout, got ${array.layout}`,
-    );
-  }
-  const data = array.bands[0];
+  // CDL is single-band paletted uint8. Either layout collapses to the
+  // same flat Uint8Array when count == 1.
+  const data =
+    array.layout === "band-separate" ? array.bands[0] : array.data;
   if (!(data instanceof Uint8Array)) {
     throw new Error(
-      `CDL band 0 expected Uint8Array, got ${data?.constructor?.name}`,
+      `CDL tile expected Uint8Array, got ${data?.constructor?.name}`,
     );
   }
   if (data.length !== width * height) {
     throw new Error(
-      `CDL band 0 length ${data.length} != ${width}*${height}`,
+      `CDL tile length ${data.length} != ${width}*${height}`,
     );
   }
 
@@ -191,24 +186,21 @@ export default function App() {
     return [mosaic];
   }, [renderTile, stacItems]);
 
-  // Center on the bbox union of the items.
-  const center = useMemo(() => {
-    if (stacItems.length === 0) return { longitude: -93.6, latitude: 41.6, zoom: 7 };
-    const xs = stacItems.flatMap((it) => [it.bbox[0], it.bbox[2]]);
-    const ys = stacItems.flatMap((it) => [it.bbox[1], it.bbox[3]]);
-    return {
-      longitude: (Math.min(...xs) + Math.max(...xs)) / 2,
-      latitude: (Math.min(...ys) + Math.max(...ys)) / 2,
-      zoom: 7,
-    };
-  }, [stacItems]);
+  // CONUS overview — matches the NLCD-notebook UX. Pan/zoom anywhere from here.
+  const initialViewState = {
+    longitude: -98.0,
+    latitude: 39.5,
+    zoom: 3.5,
+    pitch: 0,
+    bearing: 0,
+  };
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
       <MaplibreMap
         ref={mapRef}
-        initialViewState={{ ...center, pitch: 0, bearing: 0 }}
-        minZoom={3}
+        initialViewState={initialViewState}
+        minZoom={2}
         mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
       >
         <DeckGLOverlay layers={layers} onDeviceInitialized={setDevice} />

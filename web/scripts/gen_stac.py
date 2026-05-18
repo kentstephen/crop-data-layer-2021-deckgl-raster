@@ -31,7 +31,7 @@ def main() -> None:
         "--bbox",
         nargs=4,
         type=float,
-        default=[-96.7, 40.4, -90.1, 43.6],  # Iowa
+        default=[-125.0, 24.0, -66.0, 50.0],  # CONUS (lower 48)
         metavar=("W", "S", "E", "N"),
     )
     ap.add_argument("--year", type=int, default=2021)
