@@ -51,6 +51,7 @@ def main() -> None:
 
     fc = {
         "type": "FeatureCollection",
+        "year": args.year,
         "features": [
             {
                 "bbox": item.bbox,

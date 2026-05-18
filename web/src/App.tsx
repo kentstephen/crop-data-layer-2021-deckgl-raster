@@ -22,6 +22,12 @@ import {
 import type { MapRef } from "react-map-gl/maplibre";
 
 import { cdlPaletteLookup, createCdlPaletteTexture } from "./cdlShaders";
+import {
+  CATEGORIES,
+  allDisplayCodes,
+  otherCategoryCodes,
+  type Category,
+} from "./categories";
 import { findSource, readPixel, type PickResult } from "./pick";
 import { epsgResolver } from "./proj";
 import {
@@ -38,7 +44,11 @@ type PartialSTACItem = {
   assets: { image: { href: string } };
 };
 
-type STACFeatureCollection = { features: PartialSTACItem[] };
+type STACFeatureCollection = {
+  features: PartialSTACItem[];
+  /** Crop year baked in by gen_stac.py; older JSONs may omit it. */
+  year?: number;
+};
 
 type PaletteData = {
   /** 256 * 4 RGBA bytes, base64-encoded so it survives JSON round-trip. */
@@ -170,8 +180,14 @@ export default function App() {
   const [statsTick, setStatsTick] = useState(0);
   const [labelBeforeId, setLabelBeforeId] = useState<string | undefined>(undefined);
   const [collapsed, setCollapsed] = useState(false);
+  // Codes the user wants rendered/counted. Default: all displayable codes.
+  const [activeCodes, setActiveCodes] = useState<Set<number>>(
+    () => new Set(allDisplayCodes(PALETTE_DATA.names)),
+  );
 
-  const stacItems = (STAC_DATA as unknown as STACFeatureCollection).features;
+  const stacFc = STAC_DATA as unknown as STACFeatureCollection;
+  const stacItems = stacFc.features;
+  const stacYear = stacFc.year ?? null;
   const palette = PALETTE_DATA as PaletteData;
 
   // Decode the base64 palette once on mount.
@@ -182,11 +198,28 @@ export default function App() {
     return arr;
   }, [palette.rgbaBase64]);
 
-  // Upload palette to GPU once a Device exists.
+  // Apply category-filter selection: copy the base palette but zero the
+  // alpha byte for any class not in activeCodes. The shader discards
+  // alpha=0, so filtered-out classes vanish from the map. No shader
+  // change required; we just re-upload this LUT on filter changes.
+  const filteredPaletteRgba = useMemo(() => {
+    const out = new Uint8Array(paletteRgba);
+    for (let code = 1; code < 256; code++) {
+      if (!activeCodes.has(code)) out[code * 4 + 3] = 0;
+    }
+    return out;
+  }, [paletteRgba, activeCodes]);
+
+  // Upload (and re-upload on filter change). Destroy the previous texture
+  // so we don't leak GPU memory across edits.
   useEffect(() => {
     if (!device) return;
-    setPaletteTexture(createCdlPaletteTexture(device, paletteRgba));
-  }, [device, paletteRgba]);
+    const tex = createCdlPaletteTexture(device, filteredPaletteRgba);
+    setPaletteTexture(tex);
+    return () => {
+      tex.destroy?.();
+    };
+  }, [device, filteredPaletteRgba]);
 
   // Subscribe to stats updates (fires after each tile gets recorded).
   useEffect(() => {
@@ -196,12 +229,15 @@ export default function App() {
 
   // Compute viewport-aware crop stats. Recomputes when the viewport bbox
   // changes (user pans/zooms) OR new tile data lands (statsTick bumps).
+  // Filter to only the categories the user has active.
   const cropStats: CropStat[] = useMemo(() => {
     if (!viewportBbox) return [];
-    return aggregateInViewport(viewportBbox).slice(0, 12);
+    return aggregateInViewport(viewportBbox)
+      .filter((s) => activeCodes.has(s.classCode))
+      .slice(0, 20);
     // statsTick intentionally in deps to invalidate on new tile data
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewportBbox, statsTick]);
+  }, [viewportBbox, statsTick, activeCodes]);
 
   const renderTile = useMemo(
     () => (paletteTexture ? makeRenderTile(paletteTexture) : null),
@@ -280,7 +316,7 @@ export default function App() {
         minZoom={2}
         onClick={onMapClick}
         cursor={picking ? "wait" : "crosshair"}
-        mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+        mapStyle="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
         onLoad={(e) => {
           const map = e.target;
           const b = map.getBounds();
@@ -305,8 +341,11 @@ export default function App() {
         names={palette.names}
         sourceCount={stacItems.length}
         classCount={Object.keys(palette.names).length}
+        year={stacYear}
         collapsed={collapsed}
         onToggleCollapsed={() => setCollapsed((c) => !c)}
+        activeCodes={activeCodes}
+        onActiveCodesChange={setActiveCodes}
       />
 
       {pick && (
@@ -339,16 +378,22 @@ function CropDashboard({
   names,
   sourceCount,
   classCount,
+  year,
   collapsed,
   onToggleCollapsed,
+  activeCodes,
+  onActiveCodesChange,
 }: {
   stats: CropStat[];
   paletteRgba: Uint8Array;
   names: Record<string, string>;
   sourceCount: number;
   classCount: number;
+  year: number | null;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  activeCodes: Set<number>;
+  onActiveCodesChange: (s: Set<number>) => void;
 }) {
   const totalPixels = stats.reduce((s, r) => s + r.pixelCount, 0);
   const totalAcres = stats.reduce((s, r) => s + r.areaAcres, 0);
@@ -384,6 +429,19 @@ function CropDashboard({
       >
         <div style={{ fontWeight: 600, fontSize: 14 }}>
           USDA Cropland Data Layer
+          {year != null && (
+            <span style={{
+              marginLeft: 8,
+              fontSize: 11,
+              fontWeight: 500,
+              padding: "2px 6px",
+              background: "rgba(255,255,255,0.12)",
+              borderRadius: 3,
+              verticalAlign: "middle",
+            }}>
+              {year}
+            </span>
+          )}
         </div>
         <span style={{ opacity: 0.6, fontSize: 12 }}>
           {collapsed ? "▸" : "▾"}
@@ -402,7 +460,7 @@ function CropDashboard({
       <div style={{ opacity: 0.65, fontSize: 11, marginBottom: 8 }}>
         {stats.length === 0
           ? "loading tiles…"
-          : `${fmt.format(totalAcres)} acres · ${stats.length} class${stats.length === 1 ? "" : "es"}`}
+          : `${fmt.format(totalAcres)} acres · ${fmt.format(totalPixels)} px · ${stats.length} class${stats.length === 1 ? "" : "es"}`}
       </div>
       <table style={{ width: "100%", borderCollapse: "collapse" }}>
         <tbody>
@@ -426,11 +484,14 @@ function CropDashboard({
                     }}
                   />
                 </td>
-                <td style={{ padding: "5px 4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 140 }}>
+                <td style={{ padding: "5px 4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 110 }}>
                   {names[String(row.classCode)] ?? `Class ${row.classCode}`}
                 </td>
                 <td style={{ padding: "5px 4px", textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums" }}>
                   {fmt.format(row.areaAcres)} ac
+                </td>
+                <td style={{ padding: "5px 4px", textAlign: "right", opacity: 0.6, fontVariantNumeric: "tabular-nums", fontSize: 11 }}>
+                  {fmt.format(row.pixelCount)} px
                 </td>
                 <td style={{ padding: "5px 0 5px 4px", textAlign: "right", opacity: 0.55, fontVariantNumeric: "tabular-nums", width: 36 }}>
                   {pct.toFixed(1)}%
@@ -440,8 +501,129 @@ function CropDashboard({
           })}
         </tbody>
       </table>
+
+      <div style={{
+        opacity: 0.45,
+        fontSize: 10,
+        fontFamily: "ui-monospace, SFMono-Regular, monospace",
+        marginTop: 8,
+        padding: "6px 8px",
+        background: "rgba(255,255,255,0.04)",
+        borderRadius: 4,
+        lineHeight: 1.4,
+      }}>
+        acres = pixels × pixel_area_m² × 0.000247
+        <br />
+        pixel_area_m² from EPSG:5070 affine transform
+      </div>
+
+      <CategoryFilter
+        activeCodes={activeCodes}
+        onActiveCodesChange={onActiveCodesChange}
+        names={names}
+      />
         </>
       )}
     </div>
   );
 }
+
+function CategoryFilter({
+  activeCodes,
+  onActiveCodesChange,
+  names,
+}: {
+  activeCodes: Set<number>;
+  onActiveCodesChange: (s: Set<number>) => void;
+  names: Record<string, string>;
+}) {
+  const allCodes = useMemo(() => allDisplayCodes(names), [names]);
+  const otherCodes = useMemo(() => otherCategoryCodes(names), [names]);
+
+  const setCategory = (codes: number[], on: boolean) => {
+    const next = new Set(activeCodes);
+    for (const c of codes) {
+      if (on) next.add(c);
+      else next.delete(c);
+    }
+    onActiveCodesChange(next);
+  };
+
+  const isCategoryOn = (codes: number[]) =>
+    codes.some((c) => activeCodes.has(c));
+  const isCategoryFullyOn = (codes: number[]) =>
+    codes.every((c) => activeCodes.has(c));
+
+  const rows: Array<Category | { id: "other"; label: string; codes: number[] }> = [
+    ...CATEGORIES,
+    { id: "other", label: "Other / fallow / no-data", codes: otherCodes },
+  ];
+
+  return (
+    <div style={{ marginTop: 14, borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <div style={{ fontWeight: 600, fontSize: 12 }}>Categories</div>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button
+            type="button"
+            onClick={() => onActiveCodesChange(new Set(allCodes))}
+            style={chipBtnStyle}
+          >
+            Show all
+          </button>
+          <button
+            type="button"
+            onClick={() => onActiveCodesChange(new Set())}
+            style={chipBtnStyle}
+          >
+            Hide all
+          </button>
+        </div>
+      </div>
+      {rows.map((cat) => {
+        if (cat.codes.length === 0) return null;
+        const on = isCategoryOn(cat.codes);
+        const full = isCategoryFullyOn(cat.codes);
+        return (
+          <label
+            key={cat.id}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "4px 0",
+              fontSize: 12,
+              cursor: "pointer",
+              opacity: on ? 1 : 0.55,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={full}
+              ref={(el) => {
+                if (el) el.indeterminate = on && !full;
+              }}
+              onChange={(e) => setCategory(cat.codes, e.target.checked)}
+              style={{ accentColor: "#7cc4ff" }}
+            />
+            <span style={{ flex: 1 }}>{cat.label}</span>
+            <span style={{ opacity: 0.45, fontSize: 10 }}>{cat.codes.length}</span>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+const chipBtnStyle: React.CSSProperties = {
+  appearance: "none",
+  background: "rgba(255,255,255,0.08)",
+  color: "white",
+  border: "1px solid rgba(255,255,255,0.2)",
+  borderRadius: 3,
+  padding: "3px 8px",
+  fontSize: 10,
+  cursor: "pointer",
+  textTransform: "uppercase",
+  letterSpacing: 0.4,
+};
