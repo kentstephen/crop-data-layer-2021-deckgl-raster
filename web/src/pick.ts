@@ -1,5 +1,6 @@
 import type { GeoTIFF } from "@developmentseed/geotiff";
-import proj4 from "proj4";
+
+import { lonLatToAlbers } from "./proj";
 
 /**
  * Click-to-inspect for the CDL mosaic.
@@ -16,14 +17,6 @@ import proj4 from "proj4";
  *   5. fetch that tile (usually warm in deck.gl-raster's tile cache)
  *   6. read one byte -> CDL class code -> palette.names[code]
  */
-
-// Register EPSG:5070 (NAD83 / Conus Albers) so proj4 can transform lon/lat into it.
-proj4.defs(
-  "EPSG:5070",
-  "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 " +
-    "+x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +type=crs",
-);
-const lonLatToAlbers = proj4("EPSG:4326", "EPSG:5070");
 
 export type PartialSTACItem = {
   bbox: [number, number, number, number];

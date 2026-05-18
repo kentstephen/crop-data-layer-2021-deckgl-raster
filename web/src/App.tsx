@@ -24,6 +24,12 @@ import type { MapRef } from "react-map-gl/maplibre";
 import { cdlPaletteLookup, createCdlPaletteTexture } from "./cdlShaders";
 import { findSource, readPixel, type PickResult } from "./pick";
 import { epsgResolver } from "./proj";
+import {
+  aggregateInViewport,
+  recordTile,
+  setUpdateListener,
+  type CropStat,
+} from "./stats";
 import STAC_DATA from "./minimal_stac.json";
 import PALETTE_DATA from "./palette.json";
 
@@ -73,45 +79,54 @@ function getCachedGeoTIFF(url: string, signal?: AbortSignal): Promise<GeoTIFF> {
  * [0,1] by the sampler) — the cdlPaletteLookup module unnormalizes and
  * indexes the palette LUT.
  */
-async function getTileData(
-  image: GeoTIFF | Overview,
-  options: GetTileDataOptions,
-): Promise<TextureDataT> {
-  const { device, x, y, signal } = options;
-  const tile = await image.fetchTile(x, y, { signal, boundless: false });
-  const { array } = tile;
-  const { width, height } = array;
+/**
+ * Per-source getTileData factory: closes over the source href so we can
+ * attribute each tile's histogram back to its source in stats.ts.
+ */
+function makeGetTileData(sourceHref: string) {
+  return async function getTileData(
+    image: GeoTIFF | Overview,
+    options: GetTileDataOptions,
+  ): Promise<TextureDataT> {
+    const { device, x, y, signal } = options;
+    const tile = await image.fetchTile(x, y, { signal, boundless: false });
+    const { array } = tile;
+    const { width, height } = array;
 
-  // CDL is single-band paletted uint8. Either layout collapses to the
-  // same flat Uint8Array when count == 1.
-  const data =
-    array.layout === "band-separate" ? array.bands[0] : array.data;
-  if (!(data instanceof Uint8Array)) {
-    throw new Error(
-      `CDL tile expected Uint8Array, got ${data?.constructor?.name}`,
-    );
-  }
-  if (data.length !== width * height) {
-    throw new Error(
-      `CDL tile length ${data.length} != ${width}*${height}`,
-    );
-  }
+    // CDL is single-band paletted uint8. Either layout collapses to the
+    // same flat Uint8Array when count == 1.
+    const data =
+      array.layout === "band-separate" ? array.bands[0] : array.data;
+    if (!(data instanceof Uint8Array)) {
+      throw new Error(
+        `CDL tile expected Uint8Array, got ${data?.constructor?.name}`,
+      );
+    }
+    if (data.length !== width * height) {
+      throw new Error(
+        `CDL tile length ${data.length} != ${width}*${height}`,
+      );
+    }
 
-  const texture = device.createTexture({
-    data,
-    format: "r8unorm",
-    width,
-    height,
-    sampler: {
-      // Class codes must not be interpolated; nearest only.
-      minFilter: "nearest",
-      magFilter: "nearest",
-      addressModeU: "clamp-to-edge",
-      addressModeV: "clamp-to-edge",
-    },
-  });
+    // Cheap: count class codes for the viewport-aware crop dashboard.
+    recordTile(image, sourceHref, x, y, data);
 
-  return { texture, width, height };
+    const texture = device.createTexture({
+      data,
+      format: "r8unorm",
+      width,
+      height,
+      sampler: {
+        // Class codes must not be interpolated; nearest only.
+        minFilter: "nearest",
+        magFilter: "nearest",
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge",
+      },
+    });
+
+    return { texture, width, height };
+  };
 }
 
 function makeRenderTile(paletteTexture: Texture) {
@@ -149,6 +164,12 @@ export default function App() {
   const [paletteTexture, setPaletteTexture] = useState<Texture | null>(null);
   const [pick, setPick] = useState<PickResult | null>(null);
   const [picking, setPicking] = useState(false);
+  const [viewportBbox, setViewportBbox] = useState<
+    [number, number, number, number] | null
+  >(null);
+  const [statsTick, setStatsTick] = useState(0);
+  const [labelBeforeId, setLabelBeforeId] = useState<string | undefined>(undefined);
+  const [collapsed, setCollapsed] = useState(false);
 
   const stacItems = (STAC_DATA as unknown as STACFeatureCollection).features;
   const palette = PALETTE_DATA as PaletteData;
@@ -167,6 +188,21 @@ export default function App() {
     setPaletteTexture(createCdlPaletteTexture(device, paletteRgba));
   }, [device, paletteRgba]);
 
+  // Subscribe to stats updates (fires after each tile gets recorded).
+  useEffect(() => {
+    setUpdateListener(() => setStatsTick((n) => n + 1));
+    return () => setUpdateListener(null);
+  }, []);
+
+  // Compute viewport-aware crop stats. Recomputes when the viewport bbox
+  // changes (user pans/zooms) OR new tile data lands (statsTick bumps).
+  const cropStats: CropStat[] = useMemo(() => {
+    if (!viewportBbox) return [];
+    return aggregateInViewport(viewportBbox).slice(0, 12);
+    // statsTick intentionally in deps to invalidate on new tile data
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewportBbox, statsTick]);
+
   const renderTile = useMemo(
     () => (paletteTexture ? makeRenderTile(paletteTexture) : null),
     [paletteTexture],
@@ -184,14 +220,20 @@ export default function App() {
           id: `cdl-cog-${source.assets.image.href}`,
           epsgResolver,
           geotiff: data,
-          getTileData,
+          getTileData: makeGetTileData(source.assets.image.href),
           renderTile,
           signal,
         }),
       maxCacheSize: 0,
+      // Render the raster BELOW basemap labels so place names and borders
+      // stay legible. beforeId comes from inspecting the live style's layer
+      // list (first symbol layer) — set in onLoad below.
+      // @ts-expect-error beforeId is injected by @deck.gl/mapbox; LayerProps
+      // doesn't know about it.
+      beforeId: labelBeforeId,
     });
     return [mosaic];
-  }, [renderTile, stacItems]);
+  }, [renderTile, stacItems, labelBeforeId]);
 
   // CONUS overview — matches the NLCD-notebook UX. Pan/zoom anywhere from here.
   const initialViewState = {
@@ -239,26 +281,34 @@ export default function App() {
         onClick={onMapClick}
         cursor={picking ? "wait" : "crosshair"}
         mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+        onLoad={(e) => {
+          const map = e.target;
+          const b = map.getBounds();
+          setViewportBbox([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
+          // Find the first symbol (label) layer in whatever style is loaded,
+          // so deck.gl renders underneath it. Falls back to undefined (deck
+          // on top) if there are no symbol layers, which is fine.
+          const layers = map.getStyle()?.layers ?? [];
+          const firstSymbol = layers.find((l: any) => l.type === "symbol");
+          if (firstSymbol) setLabelBeforeId(firstSymbol.id);
+        }}
+        onMoveEnd={(e) => {
+          const b = e.target.getBounds();
+          setViewportBbox([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
+        }}
       >
         <DeckGLOverlay layers={layers} onDeviceInitialized={setDevice} />
       </MaplibreMap>
-      <div
-        style={{
-          position: "absolute",
-          top: 12,
-          left: 12,
-          padding: "8px 12px",
-          background: "rgba(0,0,0,0.6)",
-          color: "white",
-          fontSize: 13,
-          borderRadius: 4,
-        }}
-      >
-        CDL mosaic — {stacItems.length} items, {Object.keys(palette.names).length} classes
-        <div style={{ opacity: 0.7, fontSize: 11, marginTop: 4 }}>
-          Click any pixel to inspect.
-        </div>
-      </div>
+      <CropDashboard
+        stats={cropStats}
+        paletteRgba={paletteRgba}
+        names={palette.names}
+        sourceCount={stacItems.length}
+        classCount={Object.keys(palette.names).length}
+        collapsed={collapsed}
+        onToggleCollapsed={() => setCollapsed((c) => !c)}
+      />
+
       {pick && (
         <div
           style={{
@@ -278,6 +328,119 @@ export default function App() {
             class {pick.classCode} · {pick.lng.toFixed(4)}, {pick.lat.toFixed(4)}
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+function CropDashboard({
+  stats,
+  paletteRgba,
+  names,
+  sourceCount,
+  classCount,
+  collapsed,
+  onToggleCollapsed,
+}: {
+  stats: CropStat[];
+  paletteRgba: Uint8Array;
+  names: Record<string, string>;
+  sourceCount: number;
+  classCount: number;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+}) {
+  const totalPixels = stats.reduce((s, r) => s + r.pixelCount, 0);
+  const totalAcres = stats.reduce((s, r) => s + r.areaAcres, 0);
+  const fmt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 12,
+        left: 12,
+        width: collapsed ? "auto" : 320,
+        maxHeight: "calc(100% - 24px)",
+        overflowY: "auto",
+        padding: collapsed ? "8px 12px" : "14px 16px",
+        background: "rgba(0,0,0,0.78)",
+        color: "white",
+        fontSize: 12,
+        borderRadius: 6,
+        boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
+      }}
+    >
+      <div
+        onClick={onToggleCollapsed}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          cursor: "pointer",
+          userSelect: "none",
+          gap: 12,
+        }}
+      >
+        <div style={{ fontWeight: 600, fontSize: 14 }}>
+          USDA Cropland Data Layer
+        </div>
+        <span style={{ opacity: 0.6, fontSize: 12 }}>
+          {collapsed ? "▸" : "▾"}
+        </span>
+      </div>
+
+      {collapsed ? null : (
+        <>
+      <div style={{ opacity: 0.65, fontSize: 11, marginTop: 4, marginBottom: 10 }}>
+        {sourceCount} source COGs · {classCount} classes · click any pixel to inspect
+      </div>
+
+      <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 2 }}>
+        Crops in viewport
+      </div>
+      <div style={{ opacity: 0.65, fontSize: 11, marginBottom: 8 }}>
+        {stats.length === 0
+          ? "loading tiles…"
+          : `${fmt.format(totalAcres)} acres · ${stats.length} class${stats.length === 1 ? "" : "es"}`}
+      </div>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <tbody>
+          {stats.map((row) => {
+            const i = row.classCode * 4;
+            const r = paletteRgba[i];
+            const g = paletteRgba[i + 1];
+            const b = paletteRgba[i + 2];
+            const pct = (row.pixelCount / totalPixels) * 100;
+            return (
+              <tr key={row.classCode} style={{ borderTop: "1px solid rgba(255,255,255,0.07)" }}>
+                <td style={{ padding: "5px 4px 5px 0", width: 14 }}>
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: 12,
+                      height: 12,
+                      background: `rgb(${r},${g},${b})`,
+                      border: "1px solid rgba(255,255,255,0.25)",
+                      borderRadius: 2,
+                    }}
+                  />
+                </td>
+                <td style={{ padding: "5px 4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 140 }}>
+                  {names[String(row.classCode)] ?? `Class ${row.classCode}`}
+                </td>
+                <td style={{ padding: "5px 4px", textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums" }}>
+                  {fmt.format(row.areaAcres)} ac
+                </td>
+                <td style={{ padding: "5px 0 5px 4px", textAlign: "right", opacity: 0.55, fontVariantNumeric: "tabular-nums", width: 36 }}>
+                  {pct.toFixed(1)}%
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+        </>
       )}
     </div>
   );
