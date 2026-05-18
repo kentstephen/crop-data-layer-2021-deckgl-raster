@@ -12,3 +12,4 @@ wheels/
 # Claude
 .claude/memory/
 .ipynb_checkpoints/
+cdl-stac-mosaic-items.json
