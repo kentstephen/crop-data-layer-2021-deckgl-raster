@@ -128,7 +128,20 @@ const ACRES_PER_M2 = 0.000247105;
 
 /**
  * Sum histograms across every recorded tile whose lon/lat bbox intersects
- * the viewport bbox. Returns rows sorted by pixel count descending.
+ * the viewport bbox, *weighted by the fraction of each tile's bbox that's
+ * actually inside the viewport*.
+ *
+ * Without the fraction weighting, a 7×7 km tile whose corner just barely
+ * pokes into a 1×1 km city-block viewport would contribute its full ~65k
+ * pixels — inflating area by 50×. With the weighting, the same tile
+ * contributes ~1/49 of its pixels, which is correct under the (mild)
+ * assumption that any given class is roughly uniformly distributed
+ * within the tile. For homogeneous regions (a square of cornfields)
+ * this is essentially exact; in patchy areas it's an approximation
+ * but bounded by the tile size.
+ *
+ * Counts are returned as floating-point — they're now "expected pixels
+ * of class C inside the viewport" rather than integer pixel counts.
  */
 export function aggregateInViewport(
   viewportBbox: [number, number, number, number],
@@ -139,13 +152,23 @@ export function aggregateInViewport(
   for (const source of sourceStats.values()) {
     for (const tile of source.tiles.values()) {
       const [w, s, e, n] = tile.bbox;
-      if (e < vw || w > ve || n < vs || s > vn) continue;
+      // Overlap rectangle in lon/lat degrees.
+      const ow = Math.max(w, vw);
+      const os = Math.max(s, vs);
+      const oe = Math.min(e, ve);
+      const on = Math.min(n, vn);
+      if (oe <= ow || on <= os) continue;
+
+      const tileArea = (e - w) * (n - s);
+      if (tileArea <= 0) continue;
+      const frac = ((oe - ow) * (on - os)) / tileArea;
+
       for (let c = 0; c < 256; c++) {
         const n2 = tile.histogram[c];
         if (n2 === 0) continue;
         const cur = totals.get(c) ?? { count: 0, areaM2: 0 };
-        cur.count += n2;
-        cur.areaM2 += n2 * tile.pixelAreaM2;
+        cur.count += n2 * frac;
+        cur.areaM2 += n2 * frac * tile.pixelAreaM2;
         totals.set(c, cur);
       }
     }
