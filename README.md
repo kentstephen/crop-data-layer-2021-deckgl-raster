@@ -1,13 +1,10 @@
-# CDL on Lonboard / deck.gl-raster
+# CDL via deck.gl-raster
 
 Browser-side, viewport-driven, per-class-pickable rendering of USDA's
-Cropland Data Layer (CDL) from Microsoft Planetary Computer — no tile
-server, no derived data, no hosting. Plus a small set of Python notebooks
-documenting the equivalent and partial approaches in
-[lonboard](https://developmentseed.org/lonboard/).
-
-The browser app is the headline. The notebooks are the trail of how we
-got here (and a record of what's still missing in the Python wrapper).
+Cropland Data Layer (CDL) from Microsoft Planetary Computer. No tile
+server, no derived data, no hosting — the browser opens each per-tile
+COG over HTTP Range and DevSeed's `MosaicLayer` fans out byte-range
+reads per visible map tile.
 
 ```
 +-------------+   STAC items   +---------------+   signed Range reads
@@ -33,24 +30,21 @@ got here (and a record of what's still missing in the Python wrapper).
 
 USDA NASS publishes CDL annually as zipped CONUS-wide GeoTIFFs. Microsoft
 Planetary Computer mirrors that as a STAC collection (`usda-cdl`) with
-~1095 per-tile Cloud-Optimized GeoTIFFs per year, each ~90×90 km in EPSG:5070
-Albers with built-in overview pyramids. The data has every property you want
-for a fast browser viewer (Range-readable, COG-tiled, paletted uint8, embedded
-colormap) — except it's *sharded*, not one global COG. Server-side mosaic tile
-APIs exist but lose per-pixel class codes (you only get the rendered RGB).
+~1095 per-tile Cloud-Optimized GeoTIFFs per year, each ~90×90 km in
+EPSG:5070 Albers with built-in overview pyramids. The data has every
+property you want for a fast browser viewer (Range-readable, COG-tiled,
+paletted uint8, embedded colormap) — except it's *sharded*, not one
+global COG. Server-side mosaic tile APIs exist but lose per-pixel class
+codes (you only get the rendered RGB).
 
 DevSeed has the JS side of this solved in
 [`deck.gl-raster`](https://github.com/developmentseed/deck.gl-raster):
-`MosaicLayer` indexes many COGs spatially (Flatbush), fans out viewport-driven
-byte-range reads per source, and uses each source's own overview pyramid. The
+`MosaicLayer` indexes many COGs spatially (Flatbush), fans out
+viewport-driven byte-range reads per source, and uses each source's own
+overview pyramid. The
 [`naip-mosaic` example](https://github.com/developmentseed/deck.gl-raster/tree/main/examples/naip-mosaic)
-demonstrates the pattern against MPC's NAIP collection.
-[`lonboard`](https://developmentseed.org/lonboard/) hasn't wrapped this into
-a Python constructor yet (no `RasterLayer.from_stac_items`), so the
-Python-side notebooks here can render only single tiles or
-state-scale multi-layer stacks.
-
-This repo ports the JS pattern to CDL with three additions:
+demonstrates the pattern against MPC's NAIP collection. This repo ports
+the pattern to CDL with three additions:
 
 - a 256-entry palette LUT from the GEE STAC catalog (single-band paletted
   uint8 with a custom `cdlPaletteLookup` shader module)
@@ -60,7 +54,7 @@ This repo ports the JS pattern to CDL with three additions:
 
 ---
 
-## Quick start (browser app)
+## Quick start
 
 ```bash
 cd web
@@ -76,11 +70,28 @@ uv run scripts/gen_stac.py
 npm run dev   # http://localhost:5454
 ```
 
-### What the app does
+The two Python scripts are the only Python in the repo. They use PEP-723
+inline dependency metadata so `uv run` handles everything — no separate
+project install, no venv to manage.
+
+### Why Python at all
+
+`gen_stac.py` pre-bakes SAS-signed hrefs into a static JSON. That
+sidesteps MPC's sign-endpoint rate limit at CONUS zoom (1095 parallel
+sign requests trigger 429 cascades). It's one Python step per ~1 hour
+of token TTL; the rest of the app is pure JS/TS.
+
+`gen_palette.py` fetches the CDL class table from the Google Earth
+Engine STAC catalog and bakes it into a JSON the browser imports
+statically. Only needs to re-run if GEE updates the class list (rare).
+
+---
+
+## What the app does
 
 - **CONUS mosaic** at full 30 m resolution. Pan/zoom anywhere; overviews
-  are used at low zoom (the inner `COGLayer` picks the right pyramid level
-  per source based on screen resolution).
+  are used at low zoom (the inner `COGLayer` picks the right pyramid
+  level per source based on screen resolution).
 - **Crops-in-viewport dashboard** (top-left, collapsible) with color
   swatch, crop name, acreage, pixel count, and percentage. Recomputes on
   every pan/zoom and as new tiles land. Acreage from each tile's affine
@@ -90,40 +101,11 @@ npm run dev   # http://localhost:5454
   Vegetables, Developed, Forest, Shrubland, Pasture, Wetlands, Water,
   Barren), plus an "Other / fallow / no-data" bucket. Show all / Hide all
   buttons. Filter affects both the rendered map and the dashboard counts.
-- **Click any pixel** → bottom-center popup with crop name, CDL class code,
-  and lon/lat.
-- **Basemap labels on top** of the raster — the deck.gl layer is inserted
-  before the first symbol layer in whatever maplibre style is loaded.
-
-### Why Python is in the loop at all
-
-Pre-baking SAS-signed hrefs into the JSON sidesteps MPC's
-sign-endpoint rate limit. Runtime signing at CONUS zoom triggers ~1095
-parallel sign requests, which MPC throttles aggressively (429 cascades).
-Pre-baking is one Python step per ~1 hour; the rest of the app is pure
-JS/TS. See `.claude/memory/MEMORY.md` for the long version of why this
-matters.
-
----
-
-## Quick start (Python notebooks)
-
-The notebooks document four approaches; all share the same dependencies.
-
-```bash
-uv run jupyter lab     # opens the notebook tree
-```
-
-| Notebook | What it does | Status |
-|---|---|---|
-| `raster-cog-nlcd-server.ipynb` | The reference: one big NLCD COG → `lonboard.RasterLayer.from_geotiff`. Works because NLCD is a single COG with a built-in pyramid. | Working. The shape we want for CDL. |
-| `raster-cog-cdl-pc.ipynb` | Same pattern, one CDL tile from MPC. Pickable, interactive, but only ~90 km of CDL. | Working. |
-| `deprecated/cdl-multi-rasterlayer.ipynb` | N × `RasterLayer.from_geotiff` per STAC item in a bbox. State-scale (~30–50 tiles) works; CONUS doesn't. | Working at state scale. |
-| `deprecated/cdl-lazycogs-mosaic.ipynb` | `lazycogs.open()` materializes a single reprojected xarray over many COGs → one `BitmapLayer`. CONUS works but is static (not viewport-driven). | Working but not interactive. |
-| `cdl-stac-mosaic.ipynb` | Pre-generates a minimal STAC JSON in the shape `deck.gl-raster`'s `MultiRasterTilesetDescriptor` expects, ships the best lonboard rendering achievable today (multi-RasterLayer), and includes a one-line swap comment for when a `from_stac_items` constructor exists in lonboard. | Working at state scale. |
-
-The browser app under `web/` is the next link in the chain: it shows what
-the Python side *would* look like if lonboard wrapped `MosaicLayer`.
+- **Click any pixel** → bottom-center popup with crop name, CDL class
+  code, and lon/lat.
+- **Basemap labels render on top** of the raster — the deck.gl layer is
+  inserted before the first symbol layer in whatever maplibre style is
+  loaded (Voyager by default).
 
 ---
 
@@ -131,15 +113,8 @@ the Python side *would* look like if lonboard wrapped `MosaicLayer`.
 
 ```
 .
-├── README.md                       this file
-├── NEXT.md                         decision criteria for the next session
-├── pyproject.toml                  Python deps for the notebooks
-├── raster-cog-nlcd-server.ipynb    single big COG (NLCD) — the reference
-├── raster-cog-cdl-pc.ipynb         single CDL tile via MPC
-├── cdl-stac-mosaic.ipynb           STAC-JSON prep + best-today lonboard render
-├── deprecated/                     state-scale and static-mosaic prototypes
-├── .claude/memory/MEMORY.md        verbose retrospective + design notes
-└── web/                            the browser app
+├── README.md
+└── web/
     ├── package.json                vite + react 19 + maplibre + DevSeed packages
     ├── index.html
     ├── vite.config.ts              port 5454; build target esnext (TLA in workers)
@@ -161,7 +136,7 @@ the Python side *would* look like if lonboard wrapped `MosaicLayer`.
 
 ---
 
-## Architecture (browser app)
+## Architecture
 
 ### Stack
 
@@ -207,6 +182,10 @@ Every tile uploaded to the GPU also feeds a 256-bucket histogram into module-lev
 
 Granularity is per-tile, not per-pixel: edge tiles that overlap the viewport contribute their full pixel count. Good enough for "what dominates this view"; for survey-grade acreage you'd add per-pixel viewport clipping.
 
+### Filter
+
+CDL's 134 classes are grouped into 14 USDA-style categories in `categories.ts` plus an "Other" bucket for anything unclaimed. When the user toggles a category, the alpha byte for every code in that category is set to 0 in a copy of the palette LUT, which is re-uploaded as the GPU texture. The existing `discard alpha<0.5` in `cdlPaletteLookup` does the rest — no shader change needed. Categories overlap deliberately (soybeans are both an oilseed and a legume in USDA's classifications) and the UI shows an indeterminate state when that produces partial overlap.
+
 ---
 
 ## Known footguns
@@ -215,7 +194,6 @@ Granularity is per-tile, not per-pixel: edge tiles that overlap the viewport con
 - **MPC's `usda-cdl` collection caps at 2021** despite USDA publishing through 2024. The MPC mirror is stale.
 - **Bilinear filtering on class codes produces garbage.** Both textures (class index and palette LUT) use nearest filtering. A "class 1.5" pixel is nonsense.
 - **At CONUS zoom (z<5), all 1095 sources are in view.** Each contributes its coarsest overview tile. Slow first paint but not broken — the layer's pyramid-aware loading is doing exactly the right thing for the data shape; there's no global pyramid because the data isn't one COG.
-- **Category groupings overlap** (e.g. soybeans are both an oilseed and a legume in USDA's classifications). Toggling one category may partially turn on/off a code that's also in another category — the UI shows an indeterminate checkbox state for that.
 
 ---
 
@@ -234,9 +212,7 @@ The heavy lifting is all DevSeed:
 - [`@developmentseed/deck.gl-raster`](https://github.com/developmentseed/deck.gl-raster) — render engine + mosaic + COG layer
 - [`@developmentseed/deck.gl-geotiff`](https://github.com/developmentseed/deck.gl-raster/tree/main/packages/deck.gl-geotiff) — `MosaicLayer` + `COGLayer`
 - [`@developmentseed/geotiff`](https://github.com/developmentseed/deck.gl-raster/tree/main/packages/geotiff) — pure-JS COG reader
-- [`lonboard`](https://github.com/developmentseed/lonboard) — the Python wrapper this app is "the missing constructor for"
-- [`obstore`](https://github.com/developmentseed/obstore) + [`async-geotiff`](https://github.com/developmentseed/async-geotiff) — the Python equivalents (notebooks)
 - [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/) — for hosting CDL as STAC + sharded COGs
 - [USDA NASS](https://www.nass.usda.gov/Research_and_Science/Cropland/SARS1a.php) — the underlying CDL data
 - [Google Earth Engine STAC catalog](https://storage.googleapis.com/earthengine-stac/catalog/USDA/USDA_NASS_CDL.json) — the class palette + names
-- [CartoCDN basemaps](https://carto.com/basemaps) — Positron / Voyager / dark-matter styles
+- [CartoCDN basemaps](https://carto.com/basemaps) — Voyager / Positron / dark-matter styles
