@@ -40,7 +40,7 @@ pnpm install        # or npm install
 uv run scripts/gen_palette.py     # once; only refresh if GEE updates
 uv run scripts/gen_stac.py        # re-run when SAS tokens expire (~1hr)
 
-pnpm dev            # http://localhost:3000
+pnpm dev            # http://localhost:5454
 ```
 
 To pick a different region/year:
