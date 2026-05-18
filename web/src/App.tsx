@@ -227,6 +227,25 @@ export default function App() {
     return () => setUpdateListener(null);
   }, []);
 
+  // Dev-only: on mount, ask the dev server to regenerate minimal_stac.json
+  // if it's stale (SAS tokens expire ~1hr). Vite's file watcher will HMR
+  // the fresh JSON in. No-op in prod builds where the endpoint 404s.
+  useEffect(() => {
+    fetch("/regen-stac")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((res) => {
+        if (res?.status === "regenerated") {
+          // eslint-disable-next-line no-console
+          console.info(
+            `[regen-stac] refreshed (${res.took}ms${res.bytes ? `, ${res.bytes}B` : ""})`,
+          );
+        }
+      })
+      .catch(() => {
+        // dev plugin not present (prod build) — fall through silently
+      });
+  }, []);
+
   // Compute viewport-aware crop stats. Recomputes when the viewport bbox
   // changes (user pans/zooms) OR new tile data lands (statsTick bumps).
   // Filter to only the categories the user has active.
