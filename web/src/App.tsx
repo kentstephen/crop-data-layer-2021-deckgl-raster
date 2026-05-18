@@ -14,10 +14,15 @@ import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Device, Texture } from "@luma.gl/core";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Map as MaplibreMap, useControl } from "react-map-gl/maplibre";
+import {
+  Map as MaplibreMap,
+  useControl,
+  type MapLayerMouseEvent,
+} from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
 import { cdlPaletteLookup, createCdlPaletteTexture } from "./cdlShaders";
+import { findSource, readPixel, type PickResult } from "./pick";
 import { epsgResolver } from "./proj";
 import STAC_DATA from "./minimal_stac.json";
 import PALETTE_DATA from "./palette.json";
@@ -142,6 +147,8 @@ export default function App() {
   const mapRef = useRef<MapRef>(null);
   const [device, setDevice] = useState<Device | null>(null);
   const [paletteTexture, setPaletteTexture] = useState<Texture | null>(null);
+  const [pick, setPick] = useState<PickResult | null>(null);
+  const [picking, setPicking] = useState(false);
 
   const stacItems = (STAC_DATA as unknown as STACFeatureCollection).features;
   const palette = PALETTE_DATA as PaletteData;
@@ -195,12 +202,42 @@ export default function App() {
     bearing: 0,
   };
 
+  const onMapClick = async (e: MapLayerMouseEvent) => {
+    const { lng, lat } = e.lngLat;
+    const source = findSource(stacItems, lng, lat);
+    if (!source) {
+      setPick(null);
+      return;
+    }
+    setPicking(true);
+    try {
+      // Reuse the same cache the layer uses, so a clicked pixel inside a
+      // visible tile is a free read.
+      const gt = await getCachedGeoTIFF(source.assets.image.href);
+      const result = await readPixel(
+        gt,
+        lng,
+        lat,
+        palette.names,
+        source.assets.image.href,
+      );
+      setPick(result);
+    } catch (err) {
+      console.error("pick failed:", err);
+      setPick(null);
+    } finally {
+      setPicking(false);
+    }
+  };
+
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
       <MaplibreMap
         ref={mapRef}
         initialViewState={initialViewState}
         minZoom={2}
+        onClick={onMapClick}
+        cursor={picking ? "wait" : "crosshair"}
         mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
       >
         <DeckGLOverlay layers={layers} onDeviceInitialized={setDevice} />
@@ -218,7 +255,30 @@ export default function App() {
         }}
       >
         CDL mosaic — {stacItems.length} items, {Object.keys(palette.names).length} classes
+        <div style={{ opacity: 0.7, fontSize: 11, marginTop: 4 }}>
+          Click any pixel to inspect.
+        </div>
       </div>
+      {pick && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 24,
+            left: "50%",
+            transform: "translateX(-50%)",
+            padding: "10px 16px",
+            background: "rgba(0,0,0,0.8)",
+            color: "white",
+            borderRadius: 6,
+            pointerEvents: "none",
+          }}
+        >
+          <div style={{ fontSize: 16, fontWeight: 600 }}>{pick.cropName}</div>
+          <div style={{ opacity: 0.7, fontSize: 12, marginTop: 4 }}>
+            class {pick.classCode} · {pick.lng.toFixed(4)}, {pick.lat.toFixed(4)}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
