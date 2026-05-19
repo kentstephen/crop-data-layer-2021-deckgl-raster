@@ -7,7 +7,6 @@ import type {
   RasterModule,
   RenderTileResult,
 } from "@developmentseed/deck.gl-raster";
-import { CreateTexture } from "@developmentseed/deck.gl-raster/gpu-modules";
 import type { Overview } from "@developmentseed/geotiff";
 import { GeoTIFF } from "@developmentseed/geotiff";
 import { MapboxOverlay } from "@deck.gl/mapbox";
@@ -21,7 +20,13 @@ import {
 } from "react-map-gl/maplibre";
 import type { MapRef } from "react-map-gl/maplibre";
 
-import { cdlPaletteLookup, createCdlPaletteTexture } from "./cdlShaders";
+import {
+  CreateTextureUint,
+  FilterCategory,
+  PaletteColormap,
+  createCdlColormapTexture,
+  createCdlFilterLUTTexture,
+} from "./cdlShaders";
 import {
   CATEGORIES,
   allDisplayCodes,
@@ -82,16 +87,13 @@ function getCachedGeoTIFF(url: string, signal?: AbortSignal): Promise<GeoTIFF> {
 }
 
 /**
- * Read one COG tile as a single-band uint8 GPU texture.
- *
- * CDL is paletted single-band uint8 with no nodata declared. We upload as
- * r8unorm so the shader sees the class code in `color.r` (normalized to
- * [0,1] by the sampler) — the cdlPaletteLookup module unnormalizes and
- * indexes the palette LUT.
- */
-/**
  * Per-source getTileData factory: closes over the source href so we can
  * attribute each tile's histogram back to its source in stats.ts.
+ *
+ * CDL is paletted single-band uint8 with no nodata declared. We upload as
+ * r8uint so the shader reads exact class codes via `usampler2D` — no
+ * normalize/un-normalize dance, no risk of sampler filtering blending
+ * adjacent class codes.
  */
 function makeGetTileData(sourceHref: string) {
   return async function getTileData(
@@ -123,11 +125,11 @@ function makeGetTileData(sourceHref: string) {
 
     const texture = device.createTexture({
       data,
-      format: "r8unorm",
+      format: "r8uint",
       width,
       height,
       sampler: {
-        // Class codes must not be interpolated; nearest only.
+        // Integer textures must use nearest; r8uint forbids linear filtering.
         minFilter: "nearest",
         magFilter: "nearest",
         addressModeU: "clamp-to-edge",
@@ -139,11 +141,15 @@ function makeGetTileData(sourceHref: string) {
   };
 }
 
-function makeRenderTile(paletteTexture: Texture) {
+function makeRenderTile(
+  colormapTexture: Texture,
+  filterLUTTexture: Texture,
+) {
   return function renderTile(tileData: TextureDataT): RenderTileResult {
     const renderPipeline: RasterModule[] = [
-      { module: CreateTexture, props: { textureName: tileData.texture } },
-      { module: cdlPaletteLookup, props: { cdlPalette: paletteTexture } },
+      { module: CreateTextureUint, props: { textureName: tileData.texture } },
+      { module: FilterCategory, props: { categoryFilterLUT: filterLUTTexture } },
+      { module: PaletteColormap, props: { colormapTexture } },
     ];
     return { renderPipeline };
   };
@@ -171,7 +177,8 @@ function DeckGLOverlay({
 export default function App() {
   const mapRef = useRef<MapRef>(null);
   const [device, setDevice] = useState<Device | null>(null);
-  const [paletteTexture, setPaletteTexture] = useState<Texture | null>(null);
+  const [colormapTexture, setColormapTexture] = useState<Texture | null>(null);
+  const [filterLUTTexture, setFilterLUTTexture] = useState<Texture | null>(null);
   const [pick, setPick] = useState<PickResult | null>(null);
   const [picking, setPicking] = useState(false);
   const [viewportBbox, setViewportBbox] = useState<
@@ -198,28 +205,26 @@ export default function App() {
     return arr;
   }, [palette.rgbaBase64]);
 
-  // Apply category-filter selection: copy the base palette but zero the
-  // alpha byte for any class not in activeCodes. The shader discards
-  // alpha=0, so filtered-out classes vanish from the map. No shader
-  // change required; we just re-upload this LUT on filter changes.
-  const filteredPaletteRgba = useMemo(() => {
-    const out = new Uint8Array(paletteRgba);
-    for (let code = 1; code < 256; code++) {
-      if (!activeCodes.has(code)) out[code * 4 + 3] = 0;
-    }
-    return out;
-  }, [paletteRgba, activeCodes]);
-
-  // Upload (and re-upload on filter change). Destroy the previous texture
-  // so we don't leak GPU memory across edits.
+  // Colormap is built once from the base palette and never re-uploaded;
+  // category filtering happens in a separate small LUT below.
   useEffect(() => {
     if (!device) return;
-    const tex = createCdlPaletteTexture(device, filteredPaletteRgba);
-    setPaletteTexture(tex);
+    const tex = createCdlColormapTexture(device, paletteRgba);
+    setColormapTexture(tex);
     return () => {
       tex.destroy?.();
     };
-  }, [device, filteredPaletteRgba]);
+  }, [device, paletteRgba]);
+
+  // 256-byte boolean LUT, rebuilt on every filter change. Cheap.
+  useEffect(() => {
+    if (!device) return;
+    const tex = createCdlFilterLUTTexture(device, activeCodes);
+    setFilterLUTTexture(tex);
+    return () => {
+      tex.destroy?.();
+    };
+  }, [device, activeCodes]);
 
   // Subscribe to stats updates (fires after each tile gets recorded).
   useEffect(() => {
@@ -259,8 +264,11 @@ export default function App() {
   }, [viewportBbox, statsTick, activeCodes]);
 
   const renderTile = useMemo(
-    () => (paletteTexture ? makeRenderTile(paletteTexture) : null),
-    [paletteTexture],
+    () =>
+      colormapTexture && filterLUTTexture
+        ? makeRenderTile(colormapTexture, filterLUTTexture)
+        : null,
+    [colormapTexture, filterLUTTexture],
   );
 
   const layers = useMemo(() => {

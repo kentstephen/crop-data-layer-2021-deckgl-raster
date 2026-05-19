@@ -2,46 +2,99 @@ import type { Device, Texture } from "@luma.gl/core";
 import type { ShaderModule } from "@luma.gl/shadertools";
 
 /**
- * CDL palette lookup shader module.
+ * Integer-aware CDL render pipeline, ported from the `land-cover` example
+ * in `developmentseed/deck.gl-raster` (May 2026).
  *
- * Sits *after* a CreateTexture step in the render pipeline. The upstream
- * texture is an r8unorm single-band image whose value is the CDL class code
- * normalized to [0,1] by the texture sampler (class 0 -> 0.0, class 255 -> 1.0).
+ * Three small modules, wired in this order per tile:
  *
- * We sample a 256x1 RGBA palette texture using the class index, snap to texel
- * centers so we get exact class colors (no interpolation between adjacent
- * classes — corn != soybean blend), discard pixels with alpha 0 (CDL class 0
- * "Background"), and write the result into `color`.
+ *   1. CreateTextureUint   — sample the r8uint tile -> `ivec4 icolor`
+ *   2. FilterCategory      — texelFetch into a 256-entry boolean LUT,
+ *                            discard if the class isn't selected
+ *   3. PaletteColormap     — texelFetch into a 256-entry RGBA colormap,
+ *                            discard alpha=0 (Background + nodata)
  *
- * Critical assumption: the upstream texture is r8unorm and CreateTexture
- * emits `color = vec4(r, 0, 0, 1)`. If CreateTexture turns out to require
- * rgba8unorm in deck.gl-raster 0.7, we'll need our own create-texture variant.
+ * Everything uses `texelFetch` so the sampler filter is irrelevant to
+ * correctness — no risk of bilinear blending producing nonsense class
+ * codes between adjacent paletted pixels.
  */
-export const cdlPaletteLookup = {
-  name: "cdl-palette-lookup",
-  fs: /* glsl */ `
-    uniform sampler2D cdlPalette;
-  `,
+
+/** ----- 1. CreateTextureUint ---------------------------------------- */
+
+export type CreateTextureUintProps = {
+  /** Source `r8uint` tile texture. */
+  textureName: Texture;
+};
+
+export const CreateTextureUint = {
+  name: "create-texture-uint",
   inject: {
+    "fs:#decl": `uniform highp usampler2D textureName;`,
     "fs:DECKGL_FILTER_COLOR": /* glsl */ `
-      float idx = color.r;
-      // Snap to texel center to avoid bilinear interpolation across classes.
-      vec2 lookup = vec2(idx * (255.0 / 256.0) + (0.5 / 256.0), 0.5);
-      vec4 mapped = texture(cdlPalette, lookup);
-      if (mapped.a < 0.5) discard;
-      color = mapped;
+      ivec4 icolor = ivec4(texture(textureName, geometry.uv));
     `,
   },
-  getUniforms: (props: { cdlPalette?: Texture } = {}) => ({
-    cdlPalette: props.cdlPalette,
+  getUniforms: (props: Partial<CreateTextureUintProps> = {}) => ({
+    textureName: props.textureName,
   }),
-} as const satisfies ShaderModule<{ cdlPalette: Texture }>;
+} as const satisfies ShaderModule<CreateTextureUintProps>;
+
+/** ----- 2. FilterCategory ------------------------------------------- */
+
+export type FilterCategoryProps = {
+  /**
+   * 256x1 `r8unorm` lookup texture: byte 255 at every selected class code,
+   * 0 elsewhere. Sampled with `texelFetch` so sampler filter is moot.
+   */
+  categoryFilterLUT: Texture;
+};
+
+export const FilterCategory = {
+  name: "filter-category",
+  inject: {
+    "fs:#decl": `uniform sampler2D categoryFilterLUT;`,
+    "fs:DECKGL_FILTER_COLOR": /* glsl */ `
+      if (texelFetch(categoryFilterLUT, ivec2(icolor.r, 0), 0).r < 0.5) {
+        discard;
+      }
+    `,
+  },
+  getUniforms: (props: Partial<FilterCategoryProps> = {}) => ({
+    categoryFilterLUT: props.categoryFilterLUT,
+  }),
+} as const satisfies ShaderModule<FilterCategoryProps>;
+
+/** ----- 3. PaletteColormap ------------------------------------------ */
+
+export type PaletteColormapProps = {
+  /** 256x1 `rgba8unorm` colormap. Alpha=0 entries render as transparent. */
+  colormapTexture: Texture;
+};
+
+export const PaletteColormap = {
+  name: "palette-colormap",
+  inject: {
+    "fs:#decl": `uniform sampler2D colormapTexture;`,
+    "fs:DECKGL_FILTER_COLOR": /* glsl */ `
+      color = texelFetch(colormapTexture, ivec2(icolor.r, 0), 0);
+      if (color.a == 0.0) {
+        discard;
+      }
+    `,
+  },
+  getUniforms: (props: Partial<PaletteColormapProps> = {}) => ({
+    colormapTexture: props.colormapTexture,
+  }),
+} as const satisfies ShaderModule<PaletteColormapProps>;
+
+/** ----- Texture builders -------------------------------------------- */
 
 /**
- * Build the 256x1 RGBA palette texture from the GEE-derived palette array.
+ * Build the 256x1 RGBA colormap texture from the GEE-derived palette.
  * `paletteRgba` is a flat Uint8Array of length 1024 (256 * 4).
+ *
+ * Built once at startup. The category filter no longer mutates this.
  */
-export function createCdlPaletteTexture(
+export function createCdlColormapTexture(
   device: Device,
   paletteRgba: Uint8Array,
 ): Texture {
@@ -53,6 +106,33 @@ export function createCdlPaletteTexture(
   return device.createTexture({
     data: paletteRgba,
     format: "rgba8unorm",
+    width: 256,
+    height: 1,
+    sampler: {
+      minFilter: "nearest",
+      magFilter: "nearest",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+    },
+  });
+}
+
+/**
+ * Build a 256-entry boolean LUT (255 at selected codes, 0 elsewhere) and
+ * upload as a 256x1 r8unorm texture. Cheap to re-create on every filter
+ * change — that's the whole point of the integer pipeline.
+ */
+export function createCdlFilterLUTTexture(
+  device: Device,
+  activeCodes: Set<number>,
+): Texture {
+  const lut = new Uint8Array(256);
+  for (const code of activeCodes) {
+    if (code >= 0 && code <= 255) lut[code] = 255;
+  }
+  return device.createTexture({
+    data: lut,
+    format: "r8unorm",
     width: 256,
     height: 1,
     sampler: {

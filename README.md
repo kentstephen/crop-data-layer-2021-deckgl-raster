@@ -130,7 +130,7 @@ statically. Only needs to re-run if GEE updates the class list (rare).
         ├── proj.ts                 EPSG:5070 + lon/lat <-> Albers transforms
         ├── stats.ts                per-tile histograms + viewport-strict aggregation
         ├── pick.ts                 out-of-band click -> CDL class code + crop name
-        ├── cdlShaders.ts           r8unorm + cdlPaletteLookup shader module
+        ├── cdlShaders.ts           r8uint integer pipeline: CreateTextureUint + FilterCategory + PaletteColormap
         ├── categories.ts           CDL code -> USDA category grouping
         ├── minimal_stac.json       generated, GITIGNORED (SAS-signed, ~1hr TTL)
         └── palette.json            generated (refresh only on GEE updates)
@@ -150,7 +150,7 @@ statically. Only needs to re-run if GEE updates the class list (rare).
 | COG reader | [`@developmentseed/geotiff`](https://www.npmjs.com/package/@developmentseed/geotiff) | Range requests, TIFF parser, web-worker decoders (LERC / Deflate / Zstd) |
 | Mosaic | [`@developmentseed/deck.gl-geotiff`](https://www.npmjs.com/package/@developmentseed/deck.gl-geotiff) | `MosaicLayer` (Flatbush spatial index) + `COGLayer` (pyramid-aware tile fetching) |
 | Render | [`@developmentseed/deck.gl-raster`](https://www.npmjs.com/package/@developmentseed/deck.gl-raster) | `RasterTileLayer`, shader-module render pipeline, in-shader EPSG:5070 → Web Mercator |
-| GPU | `@luma.gl/core` + WebGL2/WebGPU | r8unorm class texture + 256×1 RGBA palette LUT |
+| GPU | `@luma.gl/core` + WebGL2/WebGPU | `r8uint` class texture (sampled via `usampler2D`) + 256×1 RGBA colormap + 256×1 r8 filter LUT |
 | Map | maplibre-gl + react-map-gl/maplibre + `@deck.gl/mapbox` | `MapboxOverlay` interleaves the deck layer beneath basemap labels |
 | Reproject | `proj4` (TS) + `@developmentseed/proj` | Picking + per-tile bbox projection (TS); GeoTIFF CRS resolution (deck.gl-raster) |
 
@@ -159,8 +159,8 @@ statically. Only needs to re-run if GEE updates the class list (rare).
 1. `MosaicLayer` asks: which of the 1095 sources intersect the current viewport bbox? (Flatbush.)
 2. For each: our `getSource` returns a cached `GeoTIFF` instance (or opens one — 16 KB header Range read).
 3. `renderSource` returns a `COGLayer` per source. The COGLayer's inner `RasterTileLayer` picks the right overview level for current screen resolution.
-4. For each visible tile: our `getTileData` does the Range fetch + LERC/Deflate decode, records the tile's histogram + lon/lat bbox in `stats.ts`, uploads as r8unorm to the GPU.
-5. `renderTile` returns `[CreateTexture, cdlPaletteLookup]`. The shader samples the class index, looks up the palette LUT, discards alpha=0 (background + filtered-out classes).
+4. For each visible tile: our `getTileData` does the Range fetch + LERC/Deflate decode, records the tile's histogram + lon/lat bbox in `stats.ts`, uploads as `r8uint` to the GPU.
+5. `renderTile` returns a three-module integer pipeline: `[CreateTextureUint, FilterCategory, PaletteColormap]`. The first samples the `r8uint` tile via `usampler2D` into an `ivec4 icolor`. The second `texelFetch`es a 256-byte boolean LUT and discards fragments whose class isn't selected. The third `texelFetch`es the 256×1 RGBA colormap and discards alpha=0 (background).
 6. deck.gl composites into maplibre's canvas, beneath the first symbol-layer in the active style.
 
 ### Picking
@@ -186,7 +186,7 @@ Granularity is per-tile, not per-pixel: edge tiles that overlap the viewport con
 
 ### Filter
 
-CDL's 134 classes are grouped into 14 USDA-style categories in `categories.ts` plus an "Other" bucket for anything unclaimed. When the user toggles a category, the alpha byte for every code in that category is set to 0 in a copy of the palette LUT, which is re-uploaded as the GPU texture. The existing `discard alpha<0.5` in `cdlPaletteLookup` does the rest — no shader change needed. Categories overlap deliberately (soybeans are both an oilseed and a legume in USDA's classifications) and the UI shows an indeterminate state when that produces partial overlap.
+CDL's 134 classes are grouped into 14 USDA-style categories in `categories.ts` plus an "Other" bucket for anything unclaimed. When the user toggles a category, we rebuild a 256-byte boolean LUT (`255` at every active class code, `0` elsewhere) and upload it as a 256×1 `r8unorm` texture. The `FilterCategory` shader module `texelFetch`es the LUT using the integer class code and discards the fragment if the entry is 0. The colormap texture is never touched — palette and filter are decoupled. Categories overlap deliberately (soybeans are both an oilseed and a legume in USDA's classifications) and the UI shows an indeterminate state when that produces partial overlap.
 
 ---
 
@@ -202,7 +202,6 @@ CDL's 134 classes are grouped into 14 USDA-style categories in `categories.ts` p
 ## What's not (yet) shipped
 
 - **GitHub Pages deployment.** Blocked by the 1-hour SAS TTL. Options: runtime sign helper (rate-limit risk; requires a concurrency limiter + retries), or a daily GitHub Action cron (broken between regens). Neither is clean.
-- **`r8uint` + `usampler2D` shader pipeline.** The `land-cover` example in `deck.gl-raster` uses an integer-sampled pipeline that's cleaner than our `r8unorm` + scale-to-index approach. Worth lifting — the shader code is example-local, not exported from the npm package. ~150 LOC port.
 - **Per-pixel viewport clipping in stats.** Current granularity is per-tile.
 
 ---
