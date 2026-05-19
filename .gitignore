@@ -10,6 +10,7 @@ wheels/
 .venv
 
 # Claude
-.claude/memory/
+
+.claude/settings.local.json
 .ipynb_checkpoints/
 cdl-stac-mosaic-items.json
