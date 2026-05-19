@@ -49,10 +49,18 @@ demonstrates the pattern against MPC's NAIP collection. This repo ports
 the pattern to CDL with three additions:
 
 - a 256-entry palette LUT from the GEE STAC catalog (single-band paletted
-  uint8 with a custom `cdlPaletteLookup` shader module)
+  uint8 rendered via a three-module integer pipeline:
+  `CreateTextureUint` → `FilterCategory` → `PaletteColormap`)
 - out-of-band per-pixel picking (lon/lat → EPSG:5070 → `geotiff.index()` →
   `fetchTile` → read one byte → `palette.names[code]`)
 - a viewport-strict crop dashboard with category filtering and acreage math
+
+> **Note (May 2026):** the renderer was ported from the original `r8unorm` +
+> normalize-back-to-index hack to the `r8uint` + `usampler2D` integer pipeline
+> from the latest `examples/land-cover` in `developmentseed/deck.gl-raster`
+> (h/t Kyle Barron). The category filter is now a separate 256-byte boolean
+> LUT texture instead of an alpha-channel mutation on the palette. Same
+> behavior, cleaner shader path, no more snap-to-texel-center math.
 
 ---
 
