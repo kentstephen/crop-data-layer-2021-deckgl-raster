@@ -155,6 +155,30 @@ function makeRenderTile(
   };
 }
 
+/**
+ * Find the closest STAC bbox by center-distance to the click point. Used
+ * only by the "no source found" warning so a developer can immediately
+ * tell whether their click was off-CONUS (huge distance) vs landed on a
+ * sliver between tiles (tiny distance).
+ */
+function nearestBboxDebug(
+  items: Array<{ bbox: [number, number, number, number] }>,
+  lng: number,
+  lat: number,
+): { dx: number; dy: number; bbox: number[] } | null {
+  let best: { d2: number; bbox: number[]; dx: number; dy: number } | null = null;
+  for (const it of items) {
+    const [w, s, e, n] = it.bbox;
+    const cx = (w + e) / 2;
+    const cy = (s + n) / 2;
+    const dx = lng - cx;
+    const dy = lat - cy;
+    const d2 = dx * dx + dy * dy;
+    if (!best || d2 < best.d2) best = { d2, bbox: it.bbox, dx, dy };
+  }
+  return best ? { dx: +best.dx.toFixed(3), dy: +best.dy.toFixed(3), bbox: best.bbox } : null;
+}
+
 function DeckGLOverlay({
   layers,
   onDeviceInitialized,
@@ -307,18 +331,65 @@ export default function App() {
     bearing: 0,
   };
 
+  /**
+   * Click -> pick. Heavily logged because the picking path is a popular
+   * source of "wait, why is nothing happening" debugging sessions. Each
+   * step prints under `[pick]` so a console-filter on that prefix gives
+   * you the full lifecycle of a click.
+   *
+   * Known failure modes seen in development:
+   *   1. No `[pick] click` log at all  -> the map onClick isn't firing.
+   *      Usually a maplibre-vs-deck overlay layering issue or the canvas
+   *      pointerEvents was disabled. Check the canvas in DevTools.
+   *   2. `findSource -> null`  -> click landed outside any STAC item bbox.
+   *      Happens at the very edges of the CONUS mosaic, in Canada/Mexico,
+   *      or on a sliver between tile bboxes. Expected; not a bug.
+   *   3. `pick failed: ... 403 / Server failed to authenticate` -> the SAS
+   *      token in `minimal_stac.json` expired. Re-run `gen_stac.py` (the
+   *      dev plugin does this on mount but only if the JSON is stale by
+   *      its mtime check). Symptom can also surface as a stuck
+   *      "wait" cursor if you click multiple times during the failure
+   *      cascade.
+   *   4. `readPixel -> null`  -> click was inside a source bbox but
+   *      outside its pixel grid (padded edge). Rare; clamped to null
+   *      inside readPixel. Looks like "click didn't register" but did.
+   */
   const onMapClick = async (e: MapLayerMouseEvent) => {
+    const t0 = performance.now();
     const { lng, lat } = e.lngLat;
+    console.log("[pick] click", {
+      lng: +lng.toFixed(5),
+      lat: +lat.toFixed(5),
+      stacItems: stacItems.length,
+      eventType: e.originalEvent?.type,
+    });
     const source = findSource(stacItems, lng, lat);
     if (!source) {
+      console.warn(
+        "[pick] findSource -> null (click outside any STAC bbox; nearest item:",
+        nearestBboxDebug(stacItems, lng, lat),
+        ")",
+      );
       setPick(null);
       return;
     }
+    console.log(
+      "[pick] findSource ->",
+      source.assets.image.href.split("?")[0],
+      "bbox:",
+      source.bbox,
+    );
     setPicking(true);
     try {
       // Reuse the same cache the layer uses, so a clicked pixel inside a
       // visible tile is a free read.
+      const tOpen = performance.now();
+      console.log("[pick] opening geotiff...");
       const gt = await getCachedGeoTIFF(source.assets.image.href);
+      console.log(
+        `[pick] geotiff opened in ${(performance.now() - tOpen).toFixed(0)}ms, reading pixel...`,
+      );
+      const tRead = performance.now();
       const result = await readPixel(
         gt,
         lng,
@@ -326,12 +397,25 @@ export default function App() {
         palette.names,
         source.assets.image.href,
       );
+      console.log(
+        `[pick] readPixel ${result ? "->" : "-> null (no data at pixel)"} in ${(performance.now() - tRead).toFixed(0)}ms`,
+        result ?? "",
+      );
+      if (!result) {
+        console.warn(
+          "[pick] click was inside source bbox but outside its pixel grid (edge-padding artifact). Try clicking a few pixels inland.",
+        );
+      }
       setPick(result);
     } catch (err) {
-      console.error("pick failed:", err);
+      console.error("[pick] failed:", err);
+      console.warn(
+        "[pick] common cause: SAS token expired in minimal_stac.json. Re-run `uv run scripts/gen_stac.py` from web/ and reload.",
+      );
       setPick(null);
     } finally {
       setPicking(false);
+      console.log(`[pick] done in ${(performance.now() - t0).toFixed(0)}ms`);
     }
   };
 
