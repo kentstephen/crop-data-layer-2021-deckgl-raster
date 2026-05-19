@@ -14,3 +14,6 @@ wheels/
 .claude/settings.local.json
 .ipynb_checkpoints/
 cdl-stac-mosaic-items.json
+
+#macos
+.DS_Store
